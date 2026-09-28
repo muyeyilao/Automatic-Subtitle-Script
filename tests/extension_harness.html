@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Subtitle extension regression checks</title>
+<style>
+  body { margin:0; background:#141c29; color:#d9e6f5; font:16px Arial,sans-serif; }
+  #player { position:absolute; left:80px; top:60px; width:960px; height:540px; }
+  video { display:block; width:100%; height:100%; background:#263c55; }
+  #result { position:absolute; top:620px; left:40px; white-space:pre-wrap; }
+</style>
+<div id="player"><video></video></div>
+<pre id="result">Running…</pre>
+<script>
+  history.replaceState(null, "", "/video/BV123abc4567/");
+  const ticks = new Map();
+  window.setInterval = (fn, delay) => { ticks.set(delay, fn); return delay; };
+  const requests = [];
+  const saved = {};
+  window.chrome = {
+    runtime: {lastError: null, sendMessage: (message, done) => requests.push({message, done})},
+    storage: {local: {
+      get: (_key, done) => done(structuredClone(saved)),
+      set: (value, done) => { Object.assign(saved, structuredClone(value)); done(); },
+    }},
+  };
+  const player = document.querySelector("video");
+  let paused = false;
+  let pauses = 0;
+  let plays = 0;
+  Object.defineProperty(player, "paused", {get: () => paused});
+  Object.defineProperty(player, "currentTime", {value: 2, writable: true});
+  player.pause = () => { paused = true; pauses++; };
+  player.play = () => { paused = false; plays++; return Promise.resolve(); };
+  window.addEventListener("error", (event) => {
+    document.querySelector("#result").textContent = "FAILED: " + event.message;
+    document.documentElement.dataset.testStatus = "failed";
+  });
+</script>
+<script src="/extension/overlay.js"></script>
+<script src="/extension/content.js"></script>
+<script>
+  const results = [];
+  const assert = (value, message) => { if (!value) throw new Error(message); };
+  const offline = {ok: false, unavailable: true};
+  const ready = {ok: true, body: {status: "ready", cues: [
+    {start: 0, end: 20, text: "这是一整句字幕，可以拖动位置和右下角调整大小。"},
+  ]}};
+  const host = () => document.querySelector("[data-whole-sentence-subtitles]");
+  const hidden = () => !host() || host().style.display === "none";
+  const reply = (payload) => { const request = requests.shift(); assert(request, "missing request");
+    request.done(payload); return request.message; };
+  const poll = (payload) => { ticks.get(2500)(); return reply(payload); };
+  const pointer = (target, name, x, y) => target.dispatchEvent(new PointerEvent(name,
+    {bubbles: true, button: 0, pointerId: 7, clientX: x, clientY: y}));
+
+  assert(pauses === 0 && hidden(), "Must not pause or show a prompt before a service reply");
+  reply(offline);
+  ticks.get(250)();
+  poll(offline);
+  assert(pauses === 0 && hidden(), "Offline polling must be silent");
+  results.push("PASS: offline startup has no overlay and never pauses playback");
+
+  poll({ok: true, body: {status: "queued"}});
+  assert(paused && !hidden(), "An available service should prepare captions");
+  poll(offline);
+  assert(!paused && hidden(), "Closing service must clear progress and undo an automatic pause");
+  const priorPlays = plays;
+  paused = true;
+  poll({ok: true, body: {status: "queued"}});
+  poll(offline);
+  assert(paused && plays === priorPlays, "A user's own pause must be preserved");
+  results.push("PASS: disconnect releases automatic pauses and preserves manual pauses");
+
+  paused = false;
+  poll(ready);
+  assert(!hidden(), "Reconnected service must display the full cue");
+  const request = poll(offline);
+  assert(request.type === "health" && hidden(), "Completed subtitles must disappear on shutdown");
+  poll(ready);
+  results.push("PASS: completed subtitles check health and reconnect automatically");
+
+  let frame = host().shadowRoot.querySelector(".frame");
+  let before = host().getBoundingClientRect();
+  pointer(frame, "pointerdown", before.left + 40, before.top + 12);
+  pointer(frame, "pointermove", before.left + 140, before.top - 48);
+  pointer(frame, "pointerup", before.left + 140, before.top - 48);
+  let after = host().getBoundingClientRect();
+  assert(Math.abs(after.left - before.left - 100) < 2, "Drag must move the subtitle horizontally");
+  assert(Math.abs(after.top - before.top + 60) < 2, "Drag must move the subtitle vertically");
+  assert(saved.subtitleLayout && saved.subtitleLayout.y < 0.86, "Dragged position must persist");
+  results.push("PASS: dragging changes and saves the subtitle position");
+
+  before = host().getBoundingClientRect();
+  const fontBefore = parseFloat(getComputedStyle(frame).fontSize);
+  const handle = host().shadowRoot.querySelector(".resize");
+  pointer(handle, "pointerdown", before.right - 5, before.bottom - 5);
+  pointer(frame, "pointermove", before.right + 65, before.bottom + 15);
+  pointer(frame, "pointerup", before.right + 65, before.bottom + 15);
+  after = host().getBoundingClientRect();
+  assert(after.width > before.width && parseFloat(getComputedStyle(frame).fontSize) > fontBefore,
+    "Resize must change both the box and the text size");
+  const restored = new BiliSubtitleOverlay(() => player);
+  assert(restored.layout.width === saved.subtitleLayout.width &&
+    restored.layout.x === saved.subtitleLayout.x, "A new overlay must restore saved settings");
+  results.push("PASS: corner resizing scales text and box, and settings survive a new instance");
+
+  pointer(frame, "pointerdown", after.left + 40, after.top + 12);
+  pointer(frame, "pointermove", -500, -500);
+  pointer(frame, "pointerup", -500, -500);
+  after = host().getBoundingClientRect();
+  const videoBounds = player.getBoundingClientRect();
+  assert(after.left >= videoBounds.left && after.top >= videoBounds.top,
+    "Dragging must keep the subtitle inside the player");
+  frame.dispatchEvent(new MouseEvent("dblclick", {bubbles: true}));
+  assert(saved.subtitleLayout.width === 0.72 && saved.subtitleLayout.x === 0.5,
+    "Double click must reset saved position and size");
+  results.push("PASS: player boundaries and double-click reset");
+
+  const fullscreen = document.querySelector("#player");
+  Object.defineProperty(document, "fullscreenElement", {get: () => fullscreen, configurable: true});
+  ticks.get(250)();
+  after = host().getBoundingClientRect();
+  assert(host().parentNode === fullscreen && after.left >= videoBounds.left &&
+    after.right <= videoBounds.right, "Fullscreen parent must preserve video-relative layout");
+  Object.defineProperty(document, "fullscreenElement", {get: () => null, configurable: true});
+  ticks.get(250)();
+  results.push("PASS: fullscreen parent change keeps the subtitle within the video");
+
+  document.querySelector("#result").textContent = results.join("\n");
+  document.documentElement.dataset.testStatus = "passed";
+</script>
+</html>

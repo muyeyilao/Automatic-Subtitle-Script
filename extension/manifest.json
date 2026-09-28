@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "B站整句字幕（本地）",
+  "version": "1.1.0",
+  "description": "提前转写语音并显示整句字幕，支持拖动和缩放。",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1:8765/*"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [{
+    "matches": ["https://www.bilibili.com/video/*"],
+    "js": ["overlay.js", "content.js"],
+    "run_at": "document_idle"
+  }]
+}
