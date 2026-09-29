@@ -3,6 +3,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import sys
 import threading
 import unittest
 from unittest.mock import patch
@@ -17,6 +18,44 @@ def word(start, end, text):
 
 
 class SubtitleTests(unittest.TestCase):
+    def test_course_hints_are_limited_to_relevant_videos(self):
+        with patch.object(app, "HOTWORDS", None):
+            self.assertIn("int", app.course_hotwords("C++ 教程：关键字"))
+            self.assertIn("int", app.course_hotwords("零基础C++教程"))
+            self.assertIsNone(app.course_hotwords("English Listening Practice"))
+        with patch.object(app, "HOTWORDS", "Fourier, 傅里叶"):
+            self.assertEqual(app.course_hotwords("C++"), "Fourier, 傅里叶")
+
+    def test_changed_recognition_settings_do_not_reuse_old_subtitles(self):
+        url = "https://www.bilibili.com/video/BV123abc4567/?p=1"
+        original = app.cache_path(url)
+        for name, value in [("BEAM_SIZE", 1), ("LANGUAGE", "zh"),
+                            ("HOTWORDS", "C++ constexpr"), ("MODEL_NAME", "small")]:
+            with self.subTest(setting=name), patch.object(app, name, value):
+                self.assertNotEqual(original, app.cache_path(url))
+        with patch.object(app, "DEVICE", "cpu"):
+            self.assertEqual(original, app.cache_path(url))
+
+    def test_mixed_speech_is_transcribed_without_previous_language_prompt(self):
+        with patch.object(app, "LANGUAGE", None):
+            options = app.transcription_options()
+            self.assertTrue(options["multilingual"])
+            self.assertFalse(options["condition_on_previous_text"])
+            self.assertEqual(options["task"], "transcribe")
+            self.assertTrue(options["word_timestamps"])
+        with patch.object(app, "LANGUAGE", "en"):
+            self.assertFalse(app.transcription_options()["multilingual"])
+
+    def test_auto_device_falls_back_but_forced_cuda_reports_missing_gpu(self):
+        fake_ct2 = SimpleNamespace(get_cuda_device_count=lambda: 0)
+        with patch.dict(sys.modules, {"ctranslate2": fake_ct2}), \
+             patch.object(app, "add_nvidia_library_paths"):
+            with patch.object(app, "runtime", None), patch.object(app, "DEVICE", "auto"):
+                self.assertEqual(app.get_runtime(), ("cpu", "int8"))
+            with patch.object(app, "runtime", None), patch.object(app, "DEVICE", "cuda"):
+                with self.assertRaisesRegex(RuntimeError, "SUBTITLE_DEVICE=cpu"):
+                    app.get_runtime()
+
     def test_video_url_and_part(self):
         self.assertEqual(
             app.canonical_video_url("https://www.bilibili.com/video/BV123abc4567?p=2&spm=tracking"),
@@ -56,9 +95,16 @@ class SubtitleTests(unittest.TestCase):
         def fake_download(command, **_kwargs):
             pattern = command[command.index("-o") + 1]
             Path(pattern.replace("%(ext)s", "m4a")).write_bytes(b"fake audio")
+            Path(pattern.replace("%(ext)s", "info.json")).write_text(
+                json.dumps({"title": "C++ 关键字"}), encoding="utf-8")
             return SimpleNamespace(returncode=0)
 
-        fake_model = SimpleNamespace(transcribe=lambda *_args, **_kwargs: (iter(segments), None))
+        def fake_transcribe(audio_path, **options):
+            self.assertTrue(audio_path.endswith(".m4a"))
+            self.assertIn("int", options["hotwords"])
+            return iter(segments), None
+
+        fake_model = SimpleNamespace(transcribe=fake_transcribe)
         url = app.canonical_video_url("https://www.bilibili.com/video/BV123abc4567")
         with tempfile.TemporaryDirectory() as temp:
             with patch.object(app, "CACHE", Path(temp)), \

@@ -23,6 +23,14 @@ This is a real-time subtitle script that gives your Bilibili videos cinematic-st
    .\.venv\Scripts\python.exe subtitle_server.py
    ```
 
+   有 NVIDIA 显卡时，先在项目目录安装一次显卡运行库（需要兼容 CUDA 12 的驱动）：
+
+   ```powershell
+   .\.venv\Scripts\python.exe -m pip install --no-cache-dir -r requirements-gpu.txt
+   ```
+
+   运行库只装在本项目 `.venv` 中。启动窗口会显示实际使用的 `cuda/int8_float16` 或 `cpu/int8`；缺少显卡或运行库时会提示并退回 CPU，处理较慢。
+
 3. 在 Chrome 或 Edge 地址栏进入 `chrome://extensions` 或 `edge://extensions`，打开**开发者模式**，点击**加载已解压的扩展程序**，选中本目录的 `extension` 文件夹。安装一次即可。
 
 4. 打开或刷新 B 站视频页。首次处理会暂停视频并提示当前阶段；开头字幕准备好后自动继续播放。播放器底部会显示完整句子。更新扩展代码后，请在扩展管理页点击一次“重新加载”，并重启字幕服务。
@@ -34,8 +42,12 @@ This is a real-time subtitle script that gives your Bilibili videos cinematic-st
 
 - 如果视频需要登录才能获取，在**启动服务前**运行 `$env:BILI_COOKIE_BROWSER='chrome'`，也可以使用 `edge` 或 `firefox`。程序会尝试读取该浏览器的 B 站登录信息；有的浏览器可能要求先退出才可读取。不要分享 `cache` 目录之外的登录资料。
 - 提前处理某个视频：`.\.venv\Scripts\python.exe subtitle_server.py --prepare "https://www.bilibili.com/video/BVxxxxxxxxxx/?p=1"`。
-- 默认使用 CPU 上的 `small` 多语言模型。若电脑处理较慢，可在启动前运行 `$env:SUBTITLE_MODEL='base'`；准确率可能下降。设置改变后，同一个视频会重新生成字幕。
-- 如课程明确是中文，可在启动前运行 `$env:SUBTITLE_LANGUAGE='zh'`，有时能减少语言识别错误。
-- 生成的字幕 JSON 保存在 `cache` 目录；可以删掉对应 JSON 后重新识别。
+- 默认模型为 `large-v3-turbo`，优先使用 NVIDIA 显卡和 `int8_float16` 精度，CPU 使用 `int8`。模型约 1.6 GB，第一次下载后保存在 `cache/models`；显卡运行库另占 `.venv` 空间。旧 `small` 模型不会自动删除。
+- 默认逐段自动识别语言，适合中英混讲，按原文转写；关闭前一段字幕的连续提示以减少错误传播和重复。只看单一语言时可设置 `$env:SUBTITLE_LANGUAGE='zh'` 或 `'en'`；恢复自动识别用 `'auto'`。中英切换的效果仍取决于音频，不能保证没有漏词或误译。
+- 默认搜索宽度为 `5`。若更重视速度，可设置 `$env:SUBTITLE_BEAM_SIZE='3'` 或 `'1'`；准确率变化需按课程实测。低置信片段最多使用三档温度尝试，避免反复重试拖慢识别。
+- 标题包含 `C++` 的视频会自动使用少量编程术语提示，帮助区分 `int`、常量、变量等词；其他课程默认不加术语。可设置 `$env:SUBTITLE_HOTWORDS='C++, constexpr, std::cout, 常量, 变量'` 覆盖自动提示；只填当前课程相关词，不宜加入大量无关词。提示只辅助识别，不会把已识别的字幕机械替换成指定词。
+- 没有显卡且速度过慢时，可设置 `$env:SUBTITLE_MODEL='small'`；准确率可能下降。可用 `$env:SUBTITLE_DEVICE='cpu'` 强制 CPU，或用 `'cuda'` 要求显卡（不可用时明确报错）。
+- 上述 PowerShell 环境变量只对该终端及其子进程有效：设置后在同一个窗口执行 `.\.venv\Scripts\python.exe subtitle_server.py`。双击启动器时默认使用本节的默认配置。
+- 生成的字幕 JSON 保存在 `cache`；模型、语言、搜索宽度或术语提示改变后会重新识别，升级也不会继续读取旧版字幕。关闭字幕服务后，可以删除 `cache` 中除 `models` 外的缓存；删掉 `models` 会导致模型重新下载。
 
 服务只监听本机 `127.0.0.1:8765`，不需要上传音频到转写服务。下载音频与首次获取模型仍需要联网。

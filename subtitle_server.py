@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -24,14 +25,99 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / "cache"
 PORT = int(os.environ.get("SUBTITLE_PORT", "8765"))
-MODEL_NAME = os.environ.get("SUBTITLE_MODEL", "small")
-LANGUAGE = os.environ.get("SUBTITLE_LANGUAGE") or None
+MODEL_NAME = os.environ.get("SUBTITLE_MODEL", "large-v3-turbo")
+LANGUAGE = os.environ.get("SUBTITLE_LANGUAGE", "").strip().lower() or None
+if LANGUAGE == "auto":
+    LANGUAGE = None
+DEVICE = os.environ.get("SUBTITLE_DEVICE", "auto").strip().lower()
+BEAM_SIZE = int(os.environ.get("SUBTITLE_BEAM_SIZE", "5"))
+if DEVICE not in {"auto", "cpu", "cuda"}:
+    raise ValueError("SUBTITLE_DEVICE 必须是 auto、cpu 或 cuda")
+if not 1 <= BEAM_SIZE <= 10:
+    raise ValueError("SUBTITLE_BEAM_SIZE 必须在 1 到 10 之间")
+HOTWORDS = os.environ.get("SUBTITLE_HOTWORDS", "").strip() or None
+CACHE_VERSION = 2
 VIDEO_RE = re.compile(r"^/video/(BV[0-9A-Za-z]+|av[0-9]+)(?:/)?$", re.I)
 HAN = r"\u3400-\u9fff"
 executor = ThreadPoolExecutor(max_workers=1)
 jobs: dict[str, dict] = {}
 lock = threading.Lock()
 model = None
+runtime = None
+_dll_handles = []
+
+
+def add_nvidia_library_paths():
+    """Make pip-installed NVIDIA DLLs visible to CTranslate2 on Windows."""
+    if os.name != "nt" or _dll_handles:
+        return
+    nvidia = Path(sysconfig.get_paths()["purelib"]) / "nvidia"
+    for package in ("cublas", "cudnn", "cuda_nvrtc", "cuda_runtime"):
+        directory = nvidia / package / "bin"
+        if directory.is_dir():
+            _dll_handles.append(os.add_dll_directory(str(directory)))
+            os.environ["PATH"] = str(directory) + os.pathsep + os.environ.get("PATH", "")
+
+
+def get_runtime():
+    global runtime
+    if runtime is not None:
+        return runtime
+    if DEVICE == "cpu":
+        runtime = ("cpu", "int8")
+        return runtime
+    add_nvidia_library_paths()
+    try:
+        import ctranslate2
+        if not ctranslate2.get_cuda_device_count():
+            raise RuntimeError("未检测到可用的 NVIDIA 显卡")
+        if os.name == "nt":
+            import ctypes
+            # Check the runtime before loading a large model onto the GPU.
+            for library in ("cublas64_12.dll", "cudnn64_9.dll", "cudnn_ops64_9.dll"):
+                ctypes.WinDLL(library)
+        supported = ctranslate2.get_supported_compute_types("cuda")
+        compute = "int8_float16" if "int8_float16" in supported else "float16"
+        if compute not in supported:
+            raise RuntimeError("显卡不支持所需的计算精度")
+        runtime = ("cuda", compute)
+    except (ImportError, OSError, RuntimeError) as error:
+        if DEVICE == "cuda":
+            raise RuntimeError("显卡不可用，请安装 requirements-gpu.txt 中的依赖，"
+                               "或设置 SUBTITLE_DEVICE=cpu。" + str(error)) from error
+        print(f"显卡加速不可用，改用 CPU（会较慢）：{error}", flush=True)
+        runtime = ("cpu", "int8")
+    return runtime
+
+
+def course_hotwords(title: str):
+    if HOTWORDS:
+        return HOTWORDS
+    # Hints guide acoustic decoding; do not replace recognized words afterwards.
+    if re.search(r"(?<![A-Za-z0-9])c\s*\+\s*\+", title, re.I):
+        return "C++, int, float, double, void, 关键字, 标识符, 编译器, 常量, 变量, 数据类型"
+    return None
+
+
+def transcription_options(course_title: str = ""):
+    return {
+        "language": LANGUAGE,
+        "task": "transcribe",
+        "multilingual": LANGUAGE is None,
+        "word_timestamps": True,
+        "beam_size": BEAM_SIZE,
+        "best_of": 3,
+        "temperature": (0.0, 0.2, 0.4),
+        "condition_on_previous_text": False,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 500, "speech_pad_ms": 400},
+        "hotwords": course_hotwords(course_title),
+    }
+
+
+def recognition_settings():
+    return {"version": CACHE_VERSION, "model": MODEL_NAME, "course_hints": "cpp-v1",
+            "options": transcription_options()}
 
 
 def canonical_video_url(raw: str) -> str:
@@ -55,7 +141,8 @@ def canonical_video_url(raw: str) -> str:
 
 
 def cache_path(url: str) -> Path:
-    digest = hashlib.sha256(f"{url}|{MODEL_NAME}|{LANGUAGE}".encode()).hexdigest()[:24]
+    settings = json.dumps(recognition_settings(), sort_keys=True, ensure_ascii=False)
+    digest = hashlib.sha256(f"{url}|{settings}".encode()).hexdigest()[:24]
     return CACHE / f"{digest}.json"
 
 
@@ -122,7 +209,9 @@ def get_model():
     global model
     if model is None:
         from faster_whisper import WhisperModel
-        model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8",
+        device, compute = get_runtime()
+        print(f"加载模型 {MODEL_NAME} | {device}/{compute} | beam={BEAM_SIZE}", flush=True)
+        model = WhisperModel(MODEL_NAME, device=device, compute_type=compute,
                              cpu_threads=min(8, os.cpu_count() or 4),
                              download_root=str(CACHE / "models"))
     return model
@@ -136,7 +225,7 @@ def prepare(url: str, progress=None) -> dict:
     CACHE.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="subtitle-audio-", dir=CACHE) as temp:
         set_job(url, "downloading")
-        command = [sys.executable, "-m", "yt_dlp", "--no-playlist",
+        command = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--write-info-json",
                    "--no-progress", "--no-warnings", "-f", "bestaudio/best",
                    "-o", str(Path(temp) / "audio.%(ext)s")]
         browser = os.environ.get("BILI_COOKIE_BROWSER", "").strip().lower()
@@ -150,14 +239,24 @@ def prepare(url: str, progress=None) -> dict:
         if result.returncode:
             detail = (result.stderr or result.stdout).strip().splitlines()
             raise RuntimeError(detail[-1] if detail else "音频下载失败")
+        course_title = ""
+        for metadata in Path(temp).glob("*.info.json"):
+            try:
+                details = json.loads(metadata.read_text(encoding="utf-8"))
+                title = details.get("title", "") if isinstance(details, dict) else ""
+                if isinstance(title, str):
+                    course_title = title[:500]
+                    break
+            except (OSError, ValueError):
+                pass
+        options = transcription_options(course_title)
         audio_files = [p for p in Path(temp).iterdir() if p.is_file() and
-                       not p.name.endswith((".part", ".ytdl"))]
+                       not p.name.endswith((".part", ".ytdl", ".json"))]
         if not audio_files:
             raise RuntimeError("音频下载后未找到文件")
         set_job(url, "transcribing")
-        segments, _ = get_model().transcribe(str(max(audio_files, key=lambda p: p.stat().st_size)),
-                                             language=LANGUAGE, word_timestamps=True,
-                                             vad_filter=True, beam_size=1)
+        segments, _ = get_model().transcribe(
+            str(max(audio_files, key=lambda p: p.stat().st_size)), **options)
         completed_segments = []
         published_through = 0.0
         for segment in segments:
@@ -171,7 +270,9 @@ def prepare(url: str, progress=None) -> dict:
         cues = make_cues(completed_segments)
     if not cues:
         raise RuntimeError("未识别出人声；请确认视频有可听清的语音")
-    payload = {"url": url, "cues": cues, "model": MODEL_NAME}
+    payload = {"url": url, "cues": cues, "model": MODEL_NAME,
+               "recognition": {**recognition_settings(), "options": options},
+               "title": course_title}
     pending = output.with_suffix(".tmp")
     pending.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     pending.replace(output)
@@ -224,7 +325,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            return self.reply(200, {"status": "ok", "model": MODEL_NAME})
+            return self.reply(200, {"status": "ok", "model": MODEL_NAME,
+                                   "device": runtime[0] if runtime else DEVICE,
+                                   "beam_size": BEAM_SIZE})
         self.reply(404, {"error": "Not found"})
 
     def reply(self, code: int, payload: dict):
@@ -241,6 +344,10 @@ def main():
     parser = argparse.ArgumentParser(description="B 站完整句字幕服务")
     parser.add_argument("--prepare", metavar="URL", help="提前处理一个 B 站视频")
     args = parser.parse_args()
+    device, compute = get_runtime()
+    language = LANGUAGE or "自动识别（支持中英混讲）"
+    print(f"识别配置：{MODEL_NAME} | {device}/{compute} | beam={BEAM_SIZE} | {language}",
+          flush=True)
     if args.prepare:
         url = canonical_video_url(args.prepare)
         payload = prepare(url)

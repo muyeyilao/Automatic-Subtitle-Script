@@ -1,0 +1,4 @@
+# Optional NVIDIA CUDA 12 / cuDNN 9 libraries; install inside the project venv.
+ctranslate2>=4.5,<5
+nvidia-cublas-cu12>=12.4,<13
+nvidia-cudnn-cu12>=9.1,<10
